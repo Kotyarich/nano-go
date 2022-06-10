@@ -1,37 +1,82 @@
 package visitor
 
 import (
-	"fmt"
-	"nano-go/parser"
-	"strconv"
+	"github.com/llir/llvm/ir"
+	"github.com/llir/llvm/ir/types"
+	"github.com/llir/llvm/ir/value"
 
-	"github.com/llvm-project/llvm/bindings/go/llvm"
+	"nano-go/parser"
+	"nano-go/visitor/strings"
+	"nano-go/visitor/type"
 )
 
+
+type Value struct {
+	Type  types.Type
+	Value value.Value
+
+	IsVariable bool
+	MultiValues []Value
+}
+
 type Visitor struct {
-	Module    llvm.Module
-	builder   llvm.Builder
-	ctx       llvm.Context
-	variables map[string]llvm.Value
+	Module   *ir.Module
+	curBlock *ir.Block
+
+	contextBlockVariables []map[string]Value
+	pkgVars				  map[string]Value
+
+}
+
+func (v *Visitor) setVar(name string, val Value) {
+	v.contextBlockVariables[len(v.contextBlockVariables)-1][name] = val
+}
+
+func (v *Visitor) pushVariablesStack() {
+	v.contextBlockVariables = append(v.contextBlockVariables, make(map[string]Value))
+}
+
+func (v *Visitor) popVariablesStack() {
+	v.contextBlockVariables = v.contextBlockVariables[0 : len(v.contextBlockVariables)-1]
 }
 
 func (v *Visitor) VisitSourceFile(ctx *parser.SourceFileContext) {
-	v.ctx = llvm.NewContext()
-	v.builder = llvm.NewBuilder()
-	v.Module = llvm.NewModule("output")
+	v.pkgVars = make(map[string]Value)
+	v.contextBlockVariables = make([]map[string]Value, 0)
+	v.Module = ir.NewModule()
 
-	fType := llvm.FunctionType(llvm.Int32Type(), []llvm.Type{}, false)
-	f := llvm.AddFunction(v.Module, "main", fType)
+	_type.ModuleStringType = v.Module.NewTypeDef("string", strings.String())
 
-	block := llvm.AddBasicBlock(f, "body")
-	v.builder.SetInsertPointAtEnd(block)
+	// Create empty string constant
+	_type.EmptyStringConstant = v.Module.NewGlobalDef(strings.NextStringName(), strings.Constant(""))
+	_type.EmptyStringConstant.Immutable = true
+
+	setExternal := func(internalName string, fn *ir.Func, variadic bool) Value {
+		fn.Sig.Variadic = variadic
+		val := Value{
+			Type: fn.Type(),
+			Value: fn,
+		}
+		v.pkgVars[internalName] = val
+		return val
+	}
+
+	setExternal("Printf", v.Module.NewFunc("printf",
+		types.I32,
+		ir.NewParam("_", types.NewPointer(types.I8)),
+	), true)
 
 	v.visitFunctionDecls(ctx.AllFunctionDecl())
-
-	v.builder.CreateRet(llvm.ConstInt(llvm.Int32Type(), 0, true))
 }
 
 func (v *Visitor) visitFunctionDecls(ctxs []parser.IFunctionDeclContext) {
+	for _, ctx := range ctxs {
+		fCtx := ctx.(*parser.FunctionDeclContext)
+		if fCtx.IDENTIFIER().GetText() != "main" {
+			v.visitFunc(fCtx)
+		}
+	}
+
 	for _, ctx := range ctxs {
 		fCtx := ctx.(*parser.FunctionDeclContext)
 		if fCtx.IDENTIFIER().GetText() == "main" {
@@ -40,141 +85,14 @@ func (v *Visitor) visitFunctionDecls(ctxs []parser.IFunctionDeclContext) {
 	}
 }
 
-func (v *Visitor) visitMain(ctx *parser.FunctionDeclContext) {
-	block := ctx.Block()
-	v.visitBlock(block.(*parser.BlockContext))
-}
-
 func (v *Visitor) visitBlock(ctx *parser.BlockContext) {
 	list := ctx.StatementList()
-	children := list.GetChildren()[1 : len(list.GetChildren())-1] // skip { and }
+	children := list.GetChildren()
 
 	for _, sCtx := range children {
-		v.visitStatement(sCtx.(*parser.StatementContext))
-	}
-}
-
-func (v *Visitor) visitStatement(ctx *parser.StatementContext) {
-	simpleCtx := ctx.SimpleStmt()
-	if simpleCtx != nil {
-		v.visitSimpleStmt(simpleCtx.(*parser.SimpleStmtContext))
-	}
-}
-
-func (v *Visitor) visitSimpleStmt(ctx *parser.SimpleStmtContext) {
-	shortDeclCtx := ctx.ShortVarDecl()
-	if shortDeclCtx != nil {
-		v.visitShortVarDecl(shortDeclCtx.(*parser.ShortVarDeclContext))
-	}
-
-	if assigmentCtx := ctx.Assignment(); assigmentCtx != nil {
-		v.visitAssigment(assigmentCtx.(*parser.AssignmentContext))
-	}
-}
-
-func (v *Visitor) visitShortVarDecl(ctx *parser.ShortVarDeclContext) {
-	identifier := ctx.IdentifierList().(*parser.IdentifierListContext).IDENTIFIER(0).GetText()
-
-	expressionCtx := ctx.ExpressionList().(*parser.ExpressionListContext).Expression(0).(*parser.ExpressionContext)
-	exprValue := v.visitExpression(expressionCtx)
-
-	alloca := v.builder.CreateAlloca(exprValue.Type(), identifier)
-	v.builder.CreateStore(exprValue, alloca)
-
-	v.variables[identifier] = alloca
-}
-
-func (v *Visitor) visitAssigment(ctx *parser.AssignmentContext) {
-	/*
-    this->builder.CreateStore(expression, variable);
-
-    return this->builder.CreateLoad(variable->getType()->getPointerElementType(), variable);
-	 */
-	leftCtx := ctx.ExpressionList(0).(*parser.ExpressionListContext).Expression(0)
-	leftValue := v.visitExpression(leftCtx.(*parser.ExpressionContext))
-	name := leftValue.Name()
-	variable := v.variables[name]
-
-	rightCtx := ctx.ExpressionList(0).(*parser.ExpressionListContext).Expression(0)
-	rightValue := v.visitExpression(rightCtx.(*parser.ExpressionContext))
-
-	v.builder.CreateStore(rightValue, variable)
-
-	v.builder.CreateLoad(variable, name)
-}
-
-func (v *Visitor) visitExpression(ctx *parser.ExpressionContext) llvm.Value {
-	if unary := ctx.GetUnary_op(); unary != nil {
-		if unary.GetTokenType() == parser.GoParserMINUS {
-			value := v.visitExpression(ctx.Expression(0).(*parser.ExpressionContext))
-			valueType := value.Type()
-			switch valueType.TypeKind() {
-			case llvm.IntegerTypeKind:
-				zero := llvm.ConstInt(valueType, 0, true)
-				return v.builder.CreateSub(zero, value, "unary_minus")
-			}
+		switch sCtx.(type) {
+		case *parser.StatementContext:
+			v.visitStatement(sCtx.(*parser.StatementContext))
 		}
 	}
-
-	if primaryExpr := ctx.PrimaryExpr(); primaryExpr != nil {
-		v.visitPrimaryExpr(primaryExpr.(*parser.PrimaryExprContext))
-	}
-
-	panic("unknown expression")
-}
-
-func (v *Visitor) visitPrimaryExpr(ctx *parser.PrimaryExprContext) llvm.Value {
-	if operand := ctx.Operand(); operand != nil {
-		return v.visitOperand(operand.(*parser.OperandContext))
-	}
-
-	panic("unknown primary expression")
-}
-
-func (v *Visitor) visitOperand(ctx *parser.OperandContext) llvm.Value {
-	if name := ctx.OperandName(); name != nil {
-		return v.visitOperandName(name.(*parser.OperandNameContext))
-	}
-
-	if literal := ctx.Literal(); literal != nil {
-		return v.visitLiteral(literal.(*parser.LiteralContext))
-	}
-
-	panic(fmt.Errorf("unknown operand"))
-}
-
-func (v *Visitor) visitOperandName(ctx *parser.OperandNameContext) llvm.Value {
-	name := ctx.IDENTIFIER().GetText()
-	variable, ok := v.variables[name]
-	if !ok {
-		panic(fmt.Errorf("unknown variable: %s", name))
-	}
-
-	return v.builder.CreateLoad(variable, name)
-}
-
-func (v *Visitor) visitLiteral(ctx *parser.LiteralContext) llvm.Value {
-	if basicLit := ctx.BasicLit(); basicLit != nil {
-		return v.visitBasicLit(basicLit.(*parser.BasicLitContext))
-	}
-
-	panic("unknown literal")
-}
-
-func (v *Visitor) visitBasicLit(ctx *parser.BasicLitContext) llvm.Value {
-	if str := ctx.String_(); str != nil {
-
-	}
-
-	if integer := ctx.Integer(); integer != nil {
-		literal := integer.(*parser.IntegerContext).DECIMAL_LIT().GetText()
-		value, _ := strconv.Atoi(literal)
-		return llvm.ConstInt(llvm.Int64Type(), uint64(value), true)
-	}
-
-	if floatLit := ctx.FLOAT_LIT(); floatLit != nil {
-
-	}
-
-	panic("unknown basic literal")
 }
